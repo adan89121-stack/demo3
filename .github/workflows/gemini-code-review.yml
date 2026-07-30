@@ -1,21 +1,67 @@
-name: Low Risk Auto Merge
+name: Gemini Code Review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, ready_for_review]
+    types: [opened, synchronize, reopened]
 
 jobs:
-  auto-merge:
-    if: contains(github.event.pull_request.labels.*.name, 'low-risk')
+  review:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       pull-requests: write
 
     steps:
-      - name: Enable auto-merge for low-risk PR
-        uses: peter-evans/enable-pull-request-automerge@v3
+      - uses: actions/checkout@v4
+
+      - name: Gemini Code Review (Auto Retry on 503)
+        id: gemini_review
+        uses: Wandalen/wretry.action@v3
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          pull-request-number: ${{ github.event.pull_request.number }}
-          merge-method: SQUASH
+          action: sshnaidm/gemini-code-review-action@v2
+          attempt_limit: 3
+          attempt_delay: 15000
+          with: |
+            gemini-key: ${{ secrets.GEMINI_API_KEY }}
+            model: gemini-2.5-flash
+            prompt: |
+              你是一位專業的 Code Reviewer。請審查本次 PR 的程式碼變更（diff）。
+
+              【審查任務與架構】
+              1. **變更摘要與對比**：
+                 - 請用 2~3 句話簡短總結本次修改的主旨。
+                 - 若這是追蹤/更新的 Commit，請簡述「相較於前版/變更前後」的主要調整。
+
+              2. **重點審查**：
+                 - **邏輯與穩定性**：潛在 Crash、邊界條件、未處理的例外、邏輯漏洞。
+                 - **資訊安全**：Hardcoded 金鑰/密碼、敏感資訊、注入風險等。
+                 - **效能與維護性**：不必要的複雜度、無效計算、可讀性問題。
+
+              3. **風險評估**：
+                 - 請直接評估本次變更的整體風險等級，並回覆「低 / 中 / 高」。
+                 - 若你判斷為「中 / 高」，簡短說明主要風險原因。
+
+              【回覆格式】
+              - 使用繁體中文回覆。
+              - 若發現問題，請提供具體程式碼修正建議。
+              - 最後一行請輸出：整體風險等級：低 / 中 / 高。
+
+      - name: Auto-label low-risk from Gemini review
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const result = `${{ steps.gemini_review.outputs.result }}`.toLowerCase();
+            core.info(`Gemini result: ${result}`);
+            if (result.includes('整體風險等級：低') || result.includes('整體風險等級：中')) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['low-risk'],
+              });
+              core.info('Added low-risk label based on Gemini review output.');
+            } else {
+              core.info('Gemini review did not classify this PR as low/medium risk.');
+            }
